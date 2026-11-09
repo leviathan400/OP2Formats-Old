@@ -1,17 +1,21 @@
 //! Checks against a real game install. Skipped (passing) when no install is found, since the
 //! game data can't be committed.
 
+use std::path::{Path, PathBuf};
+
 use op2_formats::render::MapTilesets;
 use op2_formats::{GameFiles, Map, Tileset};
 
 use op2_formats::testdata;
 
-/// A folder of OPU's copies of the stock files (`base/<sub>`), in whichever OPU folder the game uses: its own, or the
-/// one op2-rs installed. Matched case-insensitively, as GameFiles does.
-fn opu_base(files: &GameFiles, sub: &str) -> std::path::PathBuf {
-    let opu = op2_formats::install::opu_dir(files.root()).expect("an OPU folder (op2 setup --opu)");
-    let rel = std::path::Path::new("base").join(sub);
-    op2_formats::install::resolve_ci(&opu, &rel).unwrap_or_else(|| opu.join(rel))
+/// The OPU folder the game uses: its own, or the one op2-rs installed.
+fn opu_dir(files: &GameFiles) -> PathBuf {
+    op2_formats::install::opu_dir(files.root()).expect("an OPU folder (op2 setup --opu)")
+}
+
+/// OPU's loose copy of a stock file: `rel` under its `base` folder, in any case (`BASE` in copies from Windows).
+fn opu_copy(opu: &Path, rel: impl AsRef<Path>) -> Option<Vec<u8>> {
+    op2_formats::install::resolve_ci(opu, &Path::new("base").join(rel)).and_then(|p| std::fs::read(p).ok())
 }
 
 fn game() -> Option<GameFiles> {
@@ -43,11 +47,11 @@ fn vol_tilesets_match_loose_copies() {
     let Some(files) = game() else { return };
     let (_, maps_vol) = files.vols().find(|(n, _)| n.eq_ignore_ascii_case("maps.vol")).expect("maps.vol");
 
+    let opu = opu_dir(&files);
     let mut compared = 0;
     for entry in maps_vol.entries().iter().filter(|e| e.name.to_ascii_lowercase().starts_with("well")) {
         let packed = Tileset::parse(&maps_vol.read(entry).unwrap()).unwrap_or_else(|e| panic!("{}: {e}", entry.name));
-        let loose_path = opu_base(&files, "tilesets").join(entry.name.to_ascii_lowercase());
-        let Ok(loose_data) = std::fs::read(&loose_path) else { continue };
+        let Some(loose_data) = opu_copy(&opu, Path::new("tilesets").join(&entry.name)) else { continue };
         let loose = Tileset::parse(&loose_data).unwrap();
         assert_eq!(packed.tile_count, loose.tile_count, "{}", entry.name);
         assert!(packed.rgba() == loose.rgba(), "{}: pixels differ between vol and loose copy", entry.name);
@@ -85,10 +89,13 @@ fn every_sprite_image_decodes_and_unit_tables_resolve() {
     }
 
     use op2_formats::units;
+    let exe = op2_formats::exe::GameExe::of(&files).expect("Outpost2.exe tables");
+    let units = &exe.units;
+    assert_eq!((units.vehicles.len(), units.buildings.len(), units.turrets.len()), (15, 38, 12));
     let n = art.animations.len();
     let check = |a: u16, what: &str| assert!(a == units::NONE || (a as usize) < n, "{what}: {a}");
-    for v in units::vehicles() {
-        for (i, row) in v.eden.iter().chain(v.plymouth).enumerate() {
+    for v in &units.vehicles {
+        for (i, row) in v.eden.iter().chain(&v.plymouth).enumerate() {
             row.iter().for_each(|&a| check(a, &format!("{} row {i}", v.code)));
         }
         for col in 0..16 {
@@ -102,16 +109,16 @@ fn every_sprite_image_decodes_and_unit_tables_resolve() {
             }
         }
     }
-    for b in units::buildings() {
-        b.eden.iter().chain(&b.plymouth).for_each(|&a| check(a, b.code));
+    for b in &units.buildings {
+        b.eden.iter().chain(&b.plymouth).for_each(|&a| check(a, &b.code));
     }
-    for t in units::turrets() {
+    for t in &units.turrets {
         for set in [t.lynx, t.panther, t.tiger, t.guard_post].into_iter().flatten() {
-            set.a.iter().chain(&set.b).for_each(|&a| check(a, t.code));
+            set.a.iter().chain(&set.b).for_each(|&a| check(a, &t.code));
         }
     }
     // Lynx faces east in column 0 (hull wider than tall) and north in column 12 (taller than wide).
-    let lynx = units::vehicle("LYNX").unwrap();
+    let lynx = units.vehicle("LYNX").unwrap();
     let hull = |col| {
         let anim = &art.animations[lynx.chassis(false, 0, col).unwrap()];
         let layer = anim.frames[0].layers.iter().find(|l| !art.images[l.image as usize].is_shadow()).unwrap();
@@ -128,6 +135,7 @@ fn every_sprite_image_decodes_and_unit_tables_resolve() {
 #[test]
 fn lzh_entries_decompress_and_match_opu_copies() {
     let Some(files) = game() else { return };
+    let opu = opu_dir(&files);
     let mut checked = 0;
     for (archive, vol) in files.vols() {
         for entry in vol.entries().iter().filter(|e| e.compression == op2_formats::vol::Compression::Lzh) {
@@ -135,7 +143,7 @@ fn lzh_entries_decompress_and_match_opu_copies() {
             assert!(data.len() > entry.size as usize, "{}: decoded smaller than stored", entry.name);
             let lower = entry.name.to_ascii_lowercase();
             let dir = if lower.ends_with("tek.txt") { "techs" } else { "sheets" };
-            let Ok(loose) = std::fs::read(opu_base(&files, dir).join(&lower)) else { continue };
+            let Some(loose) = opu_copy(&opu, Path::new(dir).join(&lower)) else { continue };
             // Compare the real content, up to OPU's "; Garbage so checksum matches" trailer.
             let end = loose.windows(9).position(|w| w == b"; Garbage").unwrap_or(loose.len());
             let same = data.iter().zip(&loose[..end]).filter(|(a, b)| a == b).count();
@@ -151,6 +159,7 @@ fn rules_and_tech_trees_parse() {
     use op2_formats::sheets::{self, Rules, Track};
     let Some(files) = game() else { return };
     let rules = Rules::load(&files).expect("rules");
+    let exe = op2_formats::exe::GameExe::of(&files).expect("Outpost2.exe tables");
     assert_eq!(rules.vehicles.len(), 17);
     assert!(rules.weapons.len() > 25 && rules.buildings.len() > 35 && rules.space.len() > 20);
     assert_eq!(rules.mines.len(), 9);
@@ -184,7 +193,7 @@ fn rules_and_tech_trees_parse() {
         std::fs::read_to_string(e.ok()?.path().join("gamedata.json")).ok()
     }));
     let Some(dump) = dump else {
-        testdata::skip(&format!("no gamedata.json in {}", runs.display()));
+        testdata::skip_run(&format!("no gamedata.json in {}", runs.display()));
         return;
     };
     let mut checked = 0;
@@ -202,7 +211,7 @@ fn rules_and_tech_trees_parse() {
         assert_eq!(hp, v.hit_points.to_string(), "{code} hp");
         assert_eq!(field("moveSpeed").unwrap(), v.move_speed.to_string(), "{code} moveSpeed");
         assert_eq!(field("turnRate").unwrap(), v.turn_rate.to_string(), "{code} turnRate");
-        assert_eq!(field("armor").unwrap(), v.armor().to_string(), "{code} armor");
+        assert_eq!(field("armor").unwrap(), exe.armor_value(v.armor_class).to_string(), "{code} armor");
         assert_eq!(field("track").unwrap(), (v.track as u8).to_string(), "{code} track");
         checked += 1;
     }
