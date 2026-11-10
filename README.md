@@ -1,4 +1,10 @@
-# OP2Formats
+# OP2Formats (old, archived)
+
+> **This repository is archived and no longer updated.** OP2Formats now lives at
+> **https://github.com/leviathan400/OP2Formats**, which carries the full history of both op2-rs's `op2-formats`
+> crate and this repository, and is published on crates.io as
+> [`op2-formats`](https://crates.io/crates/op2-formats). Everything here (the C interface, the `.opm` and JSON map
+> readers, the format documents) continues there.
 
 Multiplatform Outpost 2 file formats library.
 
